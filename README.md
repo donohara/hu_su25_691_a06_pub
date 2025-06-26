@@ -1,6 +1,6 @@
 # Harrisburg University CISC 691 - NextGen AI - Summer 2025
 
-## This is a set of AI-generated and human tweaked pyton modules to illustrate agentic apps
+## This is a set of AI-generated and human tweaked python modules to illustrate agentic apps
 
 #### Generated on 2025-06-25 using:
  - Google Gemini 2.5 Pro
