@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+crewai
+langchain
+pydantic
+requests
+faker
+requests

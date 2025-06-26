@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="Black">
+    <option name="sdkName" value="Python 3.13 (hu_su25_691_a06)" />
+  </component>
+  <component name="NodePackageJsonFileManager">
+    <packageJsonPaths />
+  </component>
+  <component name="ProjectRootManager" version="2" project-jdk-name="Python 2.7.11 virtualenv at ~/.virtualenvs/gui_reg" project-jdk-type="Python SDK" />
+  <component name="SvnConfiguration">
+    <configuration />
+  </component>
+</project>

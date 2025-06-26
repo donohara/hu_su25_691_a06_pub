@@ -1,0 +1,4 @@
+langchain
+spacy
+fastapi
+uvicorn
