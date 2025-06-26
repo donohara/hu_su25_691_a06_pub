@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+pydantic
+requests
+PyPDF2
+chromadb
+sentence-transformers
+arxiv
+python-multipart

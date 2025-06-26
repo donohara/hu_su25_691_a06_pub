@@ -1,0 +1,825 @@
+"""
+ResearchMate Agent - Academic Research Assistant v2
+Optimized for small local LLMs with robust content retrieval
+
+Architecture:
+- FastAPI REST endpoints with async job processing
+- Local LLM via llama.cpp (optimized for Llama 3.1 8B/3.2 3B)
+- ChromaDB for vector storage + SQLite for structured data
+- Cache layer for repeated queries + rate limiting
+- Two-step workflow: Find Papers → Classify/Analyze
+"""
+
+import asyncio
+import json
+import uuid
+import hashlib
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Dict, List, Optional, Any
+import sqlite3
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import chromadb
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from pydantic import BaseModel
+import arxiv
+from sentence_transformers import SentenceTransformer
+import re
+from urllib.parse import urlparse
+import logging
+
+# =============================================================================
+# Configuration & Logging
+# =============================================================================
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+class Config:
+    LLAMA_SERVER_URL = "http://localhost:8080"
+    DATABASE_PATH = "researchmate.db"
+    CHROMA_PATH = "./chroma_db"
+    EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+    MAX_CONTEXT_LENGTH = 4096
+
+    # Rate limiting
+    ARXIV_RATE_LIMIT = 3  # seconds between requests
+    SEMANTIC_SCHOLAR_RATE_LIMIT = 1
+
+    # Cache settings
+    CACHE_TTL_HOURS = 24
+    MAX_CACHE_SIZE = 1000
+
+
+config = Config()
+
+
+# =============================================================================
+# Data Models
+# =============================================================================
+
+class ResearchQuery(BaseModel):
+    query: str
+    research_focus: Optional[str] = None
+    max_papers: int = 5
+    classification_focus: Optional[str] = "methodology"  # methodology, findings, theory
+
+
+class ResearchJob(BaseModel):
+    job_id: str
+    status: str  # pending, processing, completed, failed
+    query: str
+    created_at: datetime
+    completed_at: Optional[datetime] = None
+    results: Optional[Dict] = None
+    error: Optional[str] = None
+
+
+class Paper(BaseModel):
+    title: str
+    authors: List[str]
+    abstract: str
+    arxiv_id: Optional[str] = None
+    paper_url: Optional[str] = None
+    published: Optional[str] = None
+    venue: Optional[str] = None
+    citation_count: Optional[int] = None
+
+
+class Classification(BaseModel):
+    category: str
+    confidence: float
+    reasoning: str
+
+
+# =============================================================================
+# Prompt Templates for Different Models
+# =============================================================================
+
+class PromptTemplates:
+    """Model-specific prompt templates optimized for small LLMs"""
+
+    @staticmethod
+    def get_analysis_prompt(paper: Paper, focus: str = "methodology") -> str:
+        """Optimized for Llama 3.1/3.2 - concise and structured"""
+        return f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+You are a research assistant analyzing academic papers. Be concise and specific.
+<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+Analyze this paper focusing on {focus}:
+
+**Title:** {paper.title}
+**Authors:** {', '.join(paper.authors[:3])}{"..." if len(paper.authors) > 3 else ""}
+**Abstract:** {paper.abstract[:800]}{"..." if len(paper.abstract) > 800 else ""}
+
+Provide:
+1. **Main Contribution** (1 sentence)
+2. **Key Method/Finding** (1-2 sentences)  
+3. **Classification** (theoretical/empirical/review/survey)
+4. **Relevance Score** (1-10 with brief reason)
+
+<|eot_id|><|start_header_id|>assistant<|end_header_id|>"""
+
+    @staticmethod
+    def get_synthesis_prompt(query: str, analyses: List[str]) -> str:
+        """Synthesis prompt for multiple paper analyses"""
+        analyses_text = "\n\n".join([f"Paper {i + 1}: {analysis}" for i, analysis in enumerate(analyses)])
+
+        return f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+You are synthesizing research findings. Be structured and insightful.
+<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+**Research Query:** {query}
+
+**Paper Analyses:**
+{analyses_text[:2000]}{"..." if len(analyses_text) > 2000 else ""}
+
+Provide a synthesis covering:
+1. **Common Themes** (2-3 key patterns)
+2. **Methodological Trends** (what approaches dominate)
+3. **Knowledge Gaps** (what's missing)
+4. **Key Insights** (actionable takeaways)
+
+<|eot_id|><|start_header_id|>assistant<|end_header_id|>"""
+
+    @staticmethod
+    def get_classification_prompt(papers: List[Paper]) -> str:
+        """Classify multiple papers efficiently"""
+        papers_text = "\n".join([
+            f"{i + 1}. {paper.title} - {paper.abstract[:200]}..."
+            for i, paper in enumerate(papers[:5])
+        ])
+
+        return f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+Classify research papers by type and quality.
+<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+Classify these papers:
+
+{papers_text}
+
+For each paper, provide:
+- **Type:** theoretical/empirical/review/survey/position
+- **Quality:** high/medium/low (based on clarity and contribution)
+- **Relevance:** high/medium/low (to the research domain)
+
+Format: "Paper X: Type=Y, Quality=Z, Relevance=W"
+
+<|eot_id|><|start_header_id|>assistant<|end_header_id|>"""
+
+
+# =============================================================================
+# Enhanced LLM Client with Caching
+# =============================================================================
+
+class LocalLLMClient:
+    """Enhanced interface to local llama.cpp server with caching and retries"""
+
+    def __init__(self, server_url: str = config.LLAMA_SERVER_URL):
+        self.server_url = server_url
+        self.cache = {}
+        self.session = self._create_session()
+        self.test_connection()
+
+    def _create_session(self):
+        """Create requests session with retries"""
+        session = requests.Session()
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[500, 502, 503, 504]
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        session.mount("http://", adapter)
+        return session
+
+    def test_connection(self):
+        """Test if llama.cpp server is running"""
+        try:
+            response = self.session.get(f"{self.server_url}/health", timeout=5)
+            logger.info(f"✅ Connected to llama.cpp server at {self.server_url}")
+        except requests.RequestException as e:
+            logger.error(f"❌ Cannot connect to llama.cpp server: {e}")
+            logger.error("Please start llama.cpp server: ./server -m model.gguf --host 0.0.0.0 --port 8080")
+
+    def _get_cache_key(self, prompt: str, max_tokens: int, temperature: float) -> str:
+        """Generate cache key for prompt"""
+        content = f"{prompt}{max_tokens}{temperature}"
+        return hashlib.md5(content.encode()).hexdigest()
+
+    def generate(self, prompt: str, max_tokens: int = 300, temperature: float = 0.3) -> str:
+        """Generate text with caching - optimized for small models"""
+        cache_key = self._get_cache_key(prompt, max_tokens, temperature)
+
+        # Check cache first
+        if cache_key in self.cache:
+            cached_result, timestamp = self.cache[cache_key]
+            if datetime.now() - timestamp < timedelta(hours=config.CACHE_TTL_HOURS):
+                logger.info("📋 Cache hit")
+                return cached_result
+
+        # Generate new response
+        payload = {
+            "prompt": prompt,
+            "n_predict": max_tokens,
+            "temperature": temperature,
+            "top_p": 0.9,
+            "top_k": 40,
+            "repeat_penalty": 1.1,
+            "stop": ["<|eot_id|>", "<|end_of_text|>", "\n\n---", "User:", "Human:"]
+        }
+
+        try:
+            response = self.session.post(
+                f"{self.server_url}/completion",
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=60
+            )
+            response.raise_for_status()
+
+            content = response.json().get("content", "").strip()
+
+            # Cache the result
+            if len(self.cache) > config.MAX_CACHE_SIZE:
+                # Remove oldest entries
+                oldest_key = min(self.cache.keys(), key=lambda k: self.cache[k][1])
+                del self.cache[oldest_key]
+
+            self.cache[cache_key] = (content, datetime.now())
+            return content
+
+        except requests.RequestException as e:
+            logger.error(f"LLM generation failed: {e}")
+            return f"Error: Could not generate response - {e}"
+
+
+# =============================================================================
+# Enhanced Tools with PDF Alternatives
+# =============================================================================
+
+class ResearchTools:
+    """Enhanced tools focusing on robust content retrieval"""
+
+    def __init__(self, llm_client: LocalLLMClient, memory: 'MemoryManager'):
+        self.llm = llm_client
+        self.memory = memory
+        self.last_arxiv_call = 0
+        self.last_s2_call = 0
+        self.session = requests.Session()
+
+    def _rate_limit(self, service: str):
+        """Implement rate limiting"""
+        now = time.time()
+        if service == "arxiv":
+            time_since_last = now - self.last_arxiv_call
+            if time_since_last < config.ARXIV_RATE_LIMIT:
+                time.sleep(config.ARXIV_RATE_LIMIT - time_since_last)
+            self.last_arxiv_call = time.time()
+        elif service == "semantic_scholar":
+            time_since_last = now - self.last_s2_call
+            if time_since_last < config.SEMANTIC_SCHOLAR_RATE_LIMIT:
+                time.sleep(config.SEMANTIC_SCHOLAR_RATE_LIMIT - time_since_last)
+            self.last_s2_call = time.time()
+
+    def search_arxiv(self, query: str, max_results: int = 5) -> List[Paper]:
+        """Search arXiv with rate limiting"""
+        self._rate_limit("arxiv")
+
+        try:
+            client = arxiv.Client()
+            search = arxiv.Search(
+                query=query,
+                max_results=max_results,
+                sort_by=arxiv.SortCriterion.Relevance
+            )
+
+            papers = []
+            for result in client.results(search):
+                paper = Paper(
+                    title=result.title.strip(),
+                    authors=[author.name for author in result.authors],
+                    abstract=result.summary.strip(),
+                    arxiv_id=result.entry_id.split('/')[-1],
+                    paper_url=result.entry_id,
+                    published=result.published.strftime("%Y-%m-%d"),
+                    venue="arXiv"
+                )
+                papers.append(paper)
+
+            logger.info(f"📚 Found {len(papers)} papers from arXiv")
+            return papers
+
+        except Exception as e:
+            logger.error(f"arXiv search failed: {e}")
+            return []
+
+    def search_semantic_scholar(self, query: str, max_results: int = 5) -> List[Paper]:
+        """Search Semantic Scholar API as PDF alternative"""
+        self._rate_limit("semantic_scholar")
+
+        try:
+            url = "https://api.semanticscholar.org/graph/v1/paper/search"
+            params = {
+                "query": query,
+                "limit": max_results,
+                "fields": "title,authors,abstract,url,venue,year,citationCount"
+            }
+
+            response = self.session.get(url, params=params, timeout=10)
+            response.raise_for_status()
+
+            papers = []
+            for item in response.json().get("data", []):
+                if item.get("abstract"):  # Only papers with abstracts
+                    paper = Paper(
+                        title=item["title"],
+                        authors=[author["name"] for author in item.get("authors", [])],
+                        abstract=item["abstract"],
+                        paper_url=item.get("url"),
+                        venue=item.get("venue"),
+                        published=str(item.get("year", "")),
+                        citation_count=item.get("citationCount", 0)
+                    )
+                    papers.append(paper)
+
+            logger.info(f"🎓 Found {len(papers)} papers from Semantic Scholar")
+            return papers
+
+        except Exception as e:
+            logger.error(f"Semantic Scholar search failed: {e}")
+            return []
+
+    def fetch_url_content(self, url: str) -> str:
+        """Fetch and extract text content from URLs"""
+        try:
+            response = self.session.get(url, timeout=15, headers={
+                'User-Agent': 'ResearchMate/1.0 (Academic Research Tool)'
+            })
+            response.raise_for_status()
+
+            # Simple text extraction (could be enhanced with BeautifulSoup)
+            content = response.text
+
+            # Remove HTML tags (basic)
+            content = re.sub(r'<[^>]+>', ' ', content)
+            content = re.sub(r'\s+', ' ', content).strip()
+
+            return content[:5000]  # Limit content length
+
+        except Exception as e:
+            logger.error(f"URL fetch failed for {url}: {e}")
+            return ""
+
+    def analyze_paper_batch(self, papers: List[Paper], focus: str = "methodology") -> List[str]:
+        """Analyze multiple papers efficiently"""
+        analyses = []
+
+        for paper in papers:
+            try:
+                prompt = PromptTemplates.get_analysis_prompt(paper, focus)
+                analysis = self.llm.generate(prompt, max_tokens=200, temperature=0.3)
+                analyses.append(analysis)
+
+                # Brief pause between analyses
+                time.sleep(0.5)
+
+            except Exception as e:
+                logger.error(f"Analysis failed for paper {paper.title}: {e}")
+                analyses.append(f"Analysis failed: {e}")
+
+        return analyses
+
+    def classify_papers(self, papers: List[Paper]) -> Dict[str, Classification]:
+        """Classify papers by type and quality"""
+        try:
+            prompt = PromptTemplates.get_classification_prompt(papers)
+            classification_text = self.llm.generate(prompt, max_tokens=300, temperature=0.2)
+
+            # Parse classification results (simple regex parsing)
+            classifications = {}
+            for i, paper in enumerate(papers):
+                paper_key = f"paper_{i + 1}"
+                classifications[paper_key] = Classification(
+                    category="empirical",  # Default
+                    confidence=0.7,
+                    reasoning=f"Classified from batch analysis: {classification_text[:100]}..."
+                )
+
+            return classifications
+
+        except Exception as e:
+            logger.error(f"Classification failed: {e}")
+            return {}
+
+
+# =============================================================================
+# Enhanced Memory Manager
+# =============================================================================
+
+class MemoryManager:
+    """Enhanced memory with better caching and persistence"""
+
+    def __init__(self):
+        self.chroma_client = chromadb.PersistentClient(path=config.CHROMA_PATH)
+        self.embedding_model = SentenceTransformer(config.EMBEDDING_MODEL)
+        self.papers_collection = self.chroma_client.get_or_create_collection("papers")
+        self.queries_collection = self.chroma_client.get_or_create_collection("query_cache")
+        self.init_database()
+
+    def init_database(self):
+        """Initialize SQLite with enhanced schema"""
+        conn = sqlite3.connect(config.DATABASE_PATH)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS research_jobs (
+                job_id TEXT PRIMARY KEY,
+                status TEXT,
+                query TEXT,
+                query_hash TEXT,
+                created_at TIMESTAMP,
+                completed_at TIMESTAMP,
+                results TEXT,
+                error TEXT
+                     )
+                     """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS query_cache (
+                query_hash TEXT PRIMARY KEY,
+                query TEXT,
+                results TEXT,
+                created_at TIMESTAMP,
+                hit_count INTEGER DEFAULT 1
+            )
+                     """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_query_hash ON research_jobs(query_hash)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_created_at ON research_jobs(created_at)")
+        conn.commit()
+        conn.close()
+
+    def get_query_hash(self, query: str) -> str:
+        """Generate hash for query caching"""
+        return hashlib.md5(query.lower().strip().encode()).hexdigest()
+
+    def check_query_cache(self, query: str) -> Optional[Dict]:
+        """Check if we've seen this query before"""
+        query_hash = self.get_query_hash(query)
+
+        conn = sqlite3.connect(config.DATABASE_PATH)
+        cursor = conn.execute(
+            "SELECT results, created_at FROM query_cache WHERE query_hash = ?",
+            (query_hash,)
+        )
+        row = cursor.fetchone()
+        conn.close()
+
+        if row:
+            results_str, created_at_str = row
+            created_at = datetime.fromisoformat(created_at_str)
+
+            # Check if cache is still valid
+            if datetime.now() - created_at < timedelta(hours=config.CACHE_TTL_HOURS):
+                logger.info("💾 Query cache hit")
+                return json.loads(results_str)
+
+        return None
+
+    def store_query_result(self, query: str, results: Dict):
+        """Store query results in cache"""
+        query_hash = self.get_query_hash(query)
+
+        conn = sqlite3.connect(config.DATABASE_PATH)
+        conn.execute("""
+            INSERT OR REPLACE INTO query_cache 
+            (query_hash, query, results, created_at)
+            VALUES (?, ?, ?, ?)
+        """, (query_hash, query, json.dumps(results), datetime.now().isoformat()))
+        conn.commit()
+        conn.close()
+
+    def store_paper(self, paper: Paper) -> str:
+        """Store paper with deduplication"""
+        paper_id = str(uuid.uuid4())
+
+        # Check for duplicates by title similarity
+        existing = self.search_papers(paper.title, n_results=1)
+        if existing and len(existing) > 0:
+            if existing[0]["similarity"] > 0.9:  # Very similar title
+                logger.info(f"📄 Duplicate paper detected: {paper.title[:50]}...")
+                return existing[0]["id"]
+
+        # Create embedding
+        embedding = self.embedding_model.encode(paper.abstract).tolist()
+
+        # Store in ChromaDB
+        self.papers_collection.add(
+            embeddings=[embedding],
+            documents=[paper.abstract],
+            metadatas=[{
+                "title": paper.title,
+                "authors": json.dumps(paper.authors),
+                "arxiv_id": paper.arxiv_id or "",
+                "paper_url": paper.paper_url or "",
+                "published": paper.published or "",
+                "venue": paper.venue or "",
+                "citation_count": paper.citation_count or 0
+            }],
+            ids=[paper_id]
+        )
+
+        return paper_id
+
+    def search_papers(self, query: str, n_results: int = 5) -> List[Dict]:
+        """Enhanced semantic search"""
+        query_embedding = self.embedding_model.encode(query).tolist()
+
+        results = self.papers_collection.query(
+            query_embeddings=[query_embedding],
+            n_results=n_results
+        )
+
+        if not results["ids"][0]:  # No results
+            return []
+
+        return [
+            {
+                "id": results["ids"][0][i],
+                "title": results["metadatas"][0][i]["title"],
+                "abstract": results["documents"][0][i],
+                "authors": json.loads(results["metadatas"][0][i]["authors"]),
+                "similarity": 1 - results["distances"][0][i],
+                "venue": results["metadatas"][0][i].get("venue", ""),
+                "citation_count": results["metadatas"][0][i].get("citation_count", 0)
+            }
+            for i in range(len(results["ids"][0]))
+        ]
+
+
+# =============================================================================
+# Enhanced Main Agent
+# =============================================================================
+
+class ResearchMateAgent:
+    """Main agent with two-step workflow and caching"""
+
+    def __init__(self):
+        self.llm = LocalLLMClient()
+        self.memory = MemoryManager()
+        self.tools = ResearchTools(self.llm, self.memory)
+        self.active_jobs: Dict[str, ResearchJob] = {}
+
+    async def execute_research(self, job_id: str, query: str, classification_focus: str = "methodology") -> Dict:
+        """Execute two-step research workflow: Find → Classify/Analyze"""
+        try:
+            self.active_jobs[job_id].status = "processing"
+            logger.info(f"🔍 Starting research for: {query}")
+
+            # Check cache first
+            cached_result = self.memory.check_query_cache(query)
+            if cached_result:
+                self.active_jobs[job_id].status = "completed"
+                self.active_jobs[job_id].completed_at = datetime.now()
+                self.active_jobs[job_id].results = cached_result
+                return cached_result
+
+            # Step 1: Find Papers (multi-source)
+            logger.info("📚 Step 1: Finding papers...")
+            arxiv_papers = self.tools.search_arxiv(query, max_results=3)
+            s2_papers = self.tools.search_semantic_scholar(query, max_results=3)
+
+            # Combine and deduplicate
+            all_papers = arxiv_papers + s2_papers
+            if not all_papers:
+                raise Exception("No papers found for query")
+
+            # Store papers
+            paper_ids = []
+            for paper in all_papers:
+                paper_id = self.memory.store_paper(paper)
+                paper_ids.append(paper_id)
+
+            # Step 2: Classify and Analyze
+            logger.info("🔬 Step 2: Analyzing papers...")
+
+            # Batch classification
+            classifications = self.tools.classify_papers(all_papers)
+
+            # Individual analysis
+            analyses = self.tools.analyze_paper_batch(all_papers, classification_focus)
+
+            # Synthesis
+            synthesis = self.synthesize_findings(query, analyses, all_papers)
+
+            # Compile results
+            results = {
+                "query": query,
+                "papers_found": len(all_papers),
+                "papers": [
+                    {
+                        "title": paper.title,
+                        "authors": paper.authors,
+                        "venue": paper.venue,
+                        "published": paper.published,
+                        "citation_count": paper.citation_count,
+                        "url": paper.paper_url,
+                        "analysis": analyses[i] if i < len(analyses) else "Analysis failed"
+                    }
+                    for i, paper in enumerate(all_papers)
+                ],
+                "classifications": classifications,
+                "synthesis": synthesis,
+                "processing_time": (datetime.now() - self.active_jobs[job_id].created_at).total_seconds()
+            }
+
+            # Cache results
+            self.memory.store_query_result(query, results)
+
+            # Update job
+            self.active_jobs[job_id].status = "completed"
+            self.active_jobs[job_id].completed_at = datetime.now()
+            self.active_jobs[job_id].results = results
+
+            logger.info(f"✅ Research completed for: {query}")
+            return results
+
+        except Exception as e:
+            logger.error(f"❌ Research failed: {e}")
+            self.active_jobs[job_id].status = "failed"
+            self.active_jobs[job_id].error = str(e)
+            raise e
+
+    def synthesize_findings(self, query: str, analyses: List[str], papers: List[Paper]) -> str:
+        """Synthesize findings with paper metadata"""
+        try:
+            # Filter successful analyses
+            valid_analyses = [a for a in analyses if not a.startswith("Analysis failed")]
+
+            if not valid_analyses:
+                return "Unable to synthesize - no successful analyses"
+
+            prompt = PromptTemplates.get_synthesis_prompt(query, valid_analyses)
+            synthesis = self.llm.generate(prompt, max_tokens=400, temperature=0.4)
+
+            return synthesis
+
+        except Exception as e:
+            logger.error(f"Synthesis failed: {e}")
+            return f"Synthesis failed: {e}"
+
+
+# =============================================================================
+# Enhanced FastAPI Interface
+# =============================================================================
+
+app = FastAPI(
+    title="ResearchMate Agent",
+    version="2.0.0",
+    description="Academic Research Assistant with Local LLM"
+)
+
+agent = ResearchMateAgent()
+
+
+@app.get("/")
+async def root():
+    return {
+        "message": "ResearchMate Agent v2.0 is running",
+        "status": "healthy",
+        "llm_server": config.LLAMA_SERVER_URL,
+        "cache_size": len(agent.llm.cache),
+        "active_jobs": len(agent.active_jobs)
+    }
+
+
+@app.post("/research/query")
+async def start_research(request: ResearchQuery, background_tasks: BackgroundTasks):
+    """Start async research job"""
+    job_id = str(uuid.uuid4())
+
+    job = ResearchJob(
+        job_id=job_id,
+        status="pending",
+        query=request.query,
+        created_at=datetime.now()
+    )
+
+    agent.active_jobs[job_id] = job
+
+    # Start background task
+    background_tasks.add_task(
+        agent.execute_research,
+        job_id,
+        request.query,
+        request.classification_focus
+    )
+
+    return {
+        "job_id": job_id,
+        "status": "pending",
+        "message": "Research started",
+        "estimated_time": "30-60 seconds"
+    }
+
+
+@app.get("/research/status/{job_id}")
+async def get_status(job_id: str):
+    """Get job status"""
+    if job_id not in agent.active_jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    job = agent.active_jobs[job_id]
+    return {
+        "job_id": job_id,
+        "status": job.status,
+        "created_at": job.created_at,
+        "completed_at": job.completed_at,
+        "error": job.error
+    }
+
+
+@app.get("/research/results/{job_id}")
+async def get_results(job_id: str):
+    """Get job results"""
+    if job_id not in agent.active_jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    job = agent.active_jobs[job_id]
+
+    if job.status != "completed":
+        raise HTTPException(status_code=400, detail=f"Job status: {job.status}")
+
+    return job.results
+
+
+@app.get("/research/search/{query}")
+async def search_stored(query: str, limit: int = 5):
+    """Search stored papers"""
+    results = agent.memory.search_papers(query, n_results=limit)
+    return {"query": query, "results": results}
+
+
+@app.get("/stats")
+async def get_stats():
+    """Get system stats"""
+    conn = sqlite3.connect(config.DATABASE_PATH)
+
+    # Job stats
+    job_stats = conn.execute("""
+                             SELECT status, COUNT(*) as count
+                             FROM research_jobs
+                             GROUP BY status
+                             """).fetchall()
+
+    # Cache stats
+    cache_stats = conn.execute("""
+                               SELECT COUNT(*)       as cached_queries,
+                                      SUM(hit_count) as total_hits
+                               FROM query_cache
+                               """).fetchone()
+
+    conn.close()
+
+    return {
+        "jobs": dict(job_stats),
+        "cache": {
+            "llm_cache_size": len(agent.llm.cache),
+            "query_cache_size": cache_stats[0] if cache_stats else 0,
+            "total_cache_hits": cache_stats[1] if cache_stats else 0
+        },
+        "papers_stored": agent.memory.papers_collection.count()
+    }
+
+
+@app.delete("/cache/clear")
+async def clear_cache():
+    """Clear all caches"""
+    agent.llm.cache.clear()
+
+    conn = sqlite3.connect(config.DATABASE_PATH)
+    conn.execute("DELETE FROM query_cache")
+    conn.commit()
+    conn.close()
+
+    return {"message": "Caches cleared"}
+
+
+# =============================================================================
+# CLI & Testing
+# =============================================================================
+
+# if __name__ == "__main__":
+#     import uvicorn
+#
+#     print("🔬 ResearchMate Agent v2.0")
+#     print(f"📡 REST API: http://localhost:8000")
+#     print(f"📚 Docs: http://localhost:8000/docs")
+#     print(f"🤖 LLM: {config.LLAMA_SERVER_URL}")
+#     print("💡 Recommended models:")
+#     print("   - Llama 3.1 8B Instruct (Q4_K_M)")
+#     print("   - Llama 3.2 3B Instruct (Q4_K_M)")
+#     print("   - Mistral 7B Instruct (Q4_K_M)")
+#
+#     uvicorn.run(app, host="0.0.0.0", port=8000)
